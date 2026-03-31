@@ -250,29 +250,43 @@ class OrchestrationManager:
 
         self.scheduler = MonarchSlurm()
 
-    async def _create_all_jobs(self) -> None:
+    async def _create_all_jobs(self, max_retries: int = 3) -> None:
         """Create SLURM jobs and wait for them to be RUNNING before returning."""
         mesh_names = [f"replica_{i}" for i in range(self.spec.replica_count)]
-        if self.spec.replica_count > 1:
-            await self.scheduler.get_or_create_multi_job(
-                mesh_names, self.spec.hosts_per_replica, self.spec.gpus_per_node
-            )
-        else:
-            await self.scheduler.get_or_create_job(
-                mesh_names[0], self.spec.hosts_per_replica, self.spec.gpus_per_node
-            )
 
-        # Force the SlurmJob to wait for RUNNING and populate hostnames
-        # before replicas are started. This prevents races where replicas
-        # find the job CANCELLED before it had a chance to start.
-        job = self.scheduler.job_handles[mesh_names[0]]
-        total_nodes = sum(job._meshes.values())
-        job._all_hostnames = job._wait_for_job_start(
-            job._slurm_job_id, total_nodes
-        )
-        logger.info(
-            f"[Controller] SLURM job is RUNNING on nodes: {job._all_hostnames}"
-        )
+        for attempt in range(max_retries):
+            try:
+                if self.spec.replica_count > 1:
+                    await self.scheduler.get_or_create_multi_job(
+                        mesh_names, self.spec.hosts_per_replica, self.spec.gpus_per_node
+                    )
+                else:
+                    await self.scheduler.get_or_create_job(
+                        mesh_names[0], self.spec.hosts_per_replica, self.spec.gpus_per_node
+                    )
+
+                # Wait for SLURM job to be RUNNING and populate hostnames
+                # before replicas are started.
+                job = self.scheduler.job_handles[mesh_names[0]]
+                total_nodes = sum(job._meshes.values())
+                job._all_hostnames = job._wait_for_job_start(
+                    job._slurm_job_id, total_nodes
+                )
+                logger.info(
+                    f"[Controller] SLURM job is RUNNING on nodes: {job._all_hostnames}"
+                )
+                return
+            except RuntimeError as e:
+                logger.warning(
+                    f"[Controller] Job creation attempt {attempt + 1}/{max_retries} failed: {e}"
+                )
+                # Reset the scheduler's job handles so a fresh job can be created
+                for name in mesh_names:
+                    self.scheduler.job_handles.pop(name, None)
+                if attempt < max_retries - 1:
+                    await asyncio.sleep(5)
+                else:
+                    raise
 
     async def start_training(self) -> None:
         logger.info(
