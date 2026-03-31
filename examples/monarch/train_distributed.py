@@ -63,11 +63,30 @@ class MonarchSlurm:
         job.apply()
         self.job_handles[mesh_name] = job
 
+    async def get_or_create_multi_job(
+        self,
+        mesh_names: list,
+        nodes_per_mesh: int = 1,
+        gpus_per_node: int = 8,
+    ) -> None:
+        meshes = {name: nodes_per_mesh for name in mesh_names}
+        job = SlurmJob(
+            meshes=meshes,
+            gpus_per_node=gpus_per_node,
+            job_name=f"{self.job_name_prefix}-all",
+        )
+        job.apply()
+        for name in mesh_names:
+            self.job_handles[name] = job
+
     def kill_jobs(self):
         if not self._is_owner:
             return
-        for mesh_name in self.job_handles.keys():
-            self.kill_job(mesh_name)
+        killed = set()
+        for mesh_name, job in self.job_handles.items():
+            if id(job) not in killed:
+                killed.add(id(job))
+                self.kill_job(mesh_name)
 
     def kill_job(self, mesh_name: str):
         try:
@@ -234,9 +253,14 @@ class OrchestrationManager:
             f"[Controller] Creating training system with {self.spec.replica_count} replicas"
         )
 
-        for replica_id in range(self.spec.replica_count):
+        mesh_names = [f"replica_{i}" for i in range(self.spec.replica_count)]
+        if self.spec.replica_count > 1:
+            await self.scheduler.get_or_create_multi_job(
+                mesh_names, self.spec.hosts_per_replica, self.spec.gpus_per_node
+            )
+        else:
             await self.scheduler.get_or_create_job(
-                f"replica_{replica_id}", self.spec.hosts_per_replica
+                mesh_names[0], self.spec.hosts_per_replica, self.spec.gpus_per_node
             )
 
         mesh_futures = {}
