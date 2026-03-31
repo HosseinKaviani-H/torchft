@@ -254,6 +254,7 @@ class OrchestrationManager:
         self.lighthouse_mesh: ProcMesh | None = None
 
         self.scheduler = MonarchSlurm()
+        self._job_creation_lock = asyncio.Lock()
 
     async def _create_all_jobs(self, max_retries: int = 3) -> None:
         """Create SLURM jobs and wait for them to be RUNNING before returning."""
@@ -353,8 +354,10 @@ class OrchestrationManager:
             logger.exception(f"[Controller] replica {replica_id} failed: {e}")
             await self._run_replica(replica_id, attempt_number + 1)
 
-    async def _spin_up_replica(self, replica_id: int, attempt_number: int = 0) -> None:
-        if attempt_number != 0 and attempt_number % PROC_ATTEMPTS == 0:
+    async def _ensure_jobs_alive(self, replica_id: int, attempt_number: int) -> None:
+        """Ensure SLURM jobs are alive before spawning replicas.
+        Must be called under self._job_creation_lock."""
+        if attempt_number % PROC_ATTEMPTS == 0:
             logger.info(
                 f"[Controller] Replica {replica_id} has failed {attempt_number} times. Getting new allocation."
             )
@@ -364,9 +367,23 @@ class OrchestrationManager:
                     f"replica_{replica_id}", self.spec.hosts_per_replica
                 )
             else:
-                # Recreate the shared multi-mesh job
                 self.scheduler.kill_jobs()
                 await self._create_all_jobs()
+        elif self.spec.replica_count > 1:
+            # Check if the shared SLURM job was killed (e.g. by KILL_SLURM failure).
+            mesh_name = f"replica_{replica_id}"
+            job = self.scheduler.job_handles.get(mesh_name)
+            if job is None or not job.active:
+                logger.info(
+                    f"[Controller] Shared SLURM job is no longer active, recreating all jobs."
+                )
+                self.scheduler.kill_jobs()
+                await self._create_all_jobs()
+
+    async def _spin_up_replica(self, replica_id: int, attempt_number: int = 0) -> None:
+        if attempt_number != 0:
+            async with self._job_creation_lock:
+                await self._ensure_jobs_alive(replica_id, attempt_number)
         delay = 0 if not attempt_number else PROC_ATTEMPT_DELAY
         logger.info(
             f"[Controller] Spinning up replica with ID {replica_id} in {delay} seconds"
