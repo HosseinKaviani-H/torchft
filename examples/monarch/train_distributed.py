@@ -323,10 +323,13 @@ class OrchestrationManager:
             logger.info(
                 f"[Controller] Replica {replica_id} has failed {attempt_number} times. Getting new allocation."
             )
-            self.scheduler.kill_job(f"replica_{replica_id}")
-            await self.scheduler.get_or_create_job(
-                f"replica_{replica_id}", self.spec.hosts_per_replica
-            )
+            # Only kill and recreate if this replica has its own dedicated job.
+            # For shared multi-mesh jobs, just retry the proc mesh spawn.
+            if self.spec.replica_count == 1:
+                self.scheduler.kill_job(f"replica_{replica_id}")
+                await self.scheduler.get_or_create_job(
+                    f"replica_{replica_id}", self.spec.hosts_per_replica
+                )
         delay = 0 if not attempt_number else PROC_ATTEMPT_DELAY
         logger.info(
             f"[Controller] Spinning up replica with ID {replica_id} in {delay} seconds"
