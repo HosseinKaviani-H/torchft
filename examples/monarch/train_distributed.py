@@ -349,7 +349,9 @@ class OrchestrationManager:
             await self._spin_up_replica(replica_id, attempt_number)
             logger.info(f"[Controller] replica {replica_id} done")
             await self._teardown(replica_id)
-        except Exception as e:
+        except BaseException as e:
+            if isinstance(e, KeyboardInterrupt):
+                raise
             await self._teardown(replica_id)
             logger.exception(f"[Controller] replica {replica_id} failed: {e}")
             await self._run_replica(replica_id, attempt_number + 1)
@@ -406,13 +408,13 @@ class OrchestrationManager:
             replica = self.replicas[replica_id]
             try:
                 await replica.proc_mesh.stop()
-            except Exception as e:
+            except BaseException as e:
                 logger.exception(
                     f"[Controller] Failed to stop replica {replica_id}, it may already be stopped. {e}"
                 )
             del self.replicas[replica_id]
             del replica.proc_mesh
-        except Exception as e:
+        except BaseException as e:
             logger.exception(
                 f"[Controller] Failed to teardown replica {replica_id}: {e}"
             )
