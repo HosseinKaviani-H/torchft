@@ -250,11 +250,8 @@ class OrchestrationManager:
 
         self.scheduler = MonarchSlurm()
 
-    async def start_training(self) -> None:
-        logger.info(
-            f"[Controller] Creating training system with {self.spec.replica_count} replicas"
-        )
-
+    async def _create_all_jobs(self) -> None:
+        """Create SLURM jobs and wait for them to be RUNNING before returning."""
         mesh_names = [f"replica_{i}" for i in range(self.spec.replica_count)]
         if self.spec.replica_count > 1:
             await self.scheduler.get_or_create_multi_job(
@@ -264,6 +261,25 @@ class OrchestrationManager:
             await self.scheduler.get_or_create_job(
                 mesh_names[0], self.spec.hosts_per_replica, self.spec.gpus_per_node
             )
+
+        # Force the SlurmJob to wait for RUNNING and populate hostnames
+        # before replicas are started. This prevents races where replicas
+        # find the job CANCELLED before it had a chance to start.
+        job = self.scheduler.job_handles[mesh_names[0]]
+        total_nodes = sum(job._meshes.values())
+        job._all_hostnames = job._wait_for_job_start(
+            job._slurm_job_id, total_nodes
+        )
+        logger.info(
+            f"[Controller] SLURM job is RUNNING on nodes: {job._all_hostnames}"
+        )
+
+    async def start_training(self) -> None:
+        logger.info(
+            f"[Controller] Creating training system with {self.spec.replica_count} replicas"
+        )
+
+        await self._create_all_jobs()
 
         mesh_futures = {}
         for i in range(self.spec.replica_count):
@@ -323,13 +339,15 @@ class OrchestrationManager:
             logger.info(
                 f"[Controller] Replica {replica_id} has failed {attempt_number} times. Getting new allocation."
             )
-            # Only kill and recreate if this replica has its own dedicated job.
-            # For shared multi-mesh jobs, just retry the proc mesh spawn.
             if self.spec.replica_count == 1:
                 self.scheduler.kill_job(f"replica_{replica_id}")
                 await self.scheduler.get_or_create_job(
                     f"replica_{replica_id}", self.spec.hosts_per_replica
                 )
+            else:
+                # Recreate the shared multi-mesh job
+                self.scheduler.kill_jobs()
+                await self._create_all_jobs()
         delay = 0 if not attempt_number else PROC_ATTEMPT_DELAY
         logger.info(
             f"[Controller] Spinning up replica with ID {replica_id} in {delay} seconds"
