@@ -371,13 +371,13 @@ class OrchestrationManager:
             else:
                 self.scheduler.kill_jobs()
                 await self._create_all_jobs()
-        elif self.spec.replica_count > 1:
-            # Check if the shared SLURM job was killed (e.g. by KILL_SLURM failure).
+        else:
+            # Check if the SLURM job is actually still running (not just in-memory state).
             mesh_name = f"replica_{replica_id}"
             job = self.scheduler.job_handles.get(mesh_name)
-            if job is None or not job.active:
+            if job is None or not job._jobs_active():
                 logger.info(
-                    f"[Controller] Shared SLURM job is no longer active, recreating all jobs."
+                    f"[Controller] SLURM job is no longer active, recreating jobs."
                 )
                 self.scheduler.kill_jobs()
                 await self._create_all_jobs()
