@@ -10,16 +10,28 @@ import asyncio
 import atexit
 import os
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Dict
 
 import torch
 from monarch.actor import Actor, current_rank, endpoint, HostMesh, ProcMesh, this_host
 from monarch.job import SlurmJob
-from monarch.utils import setup_env_for_distributed
-from torchtitan.config import ConfigManager, JobConfig
+from monarch.spmd import setup_torch_elastic_env_async
+from torchtitan.components.checkpoint import CheckpointManager
+from torchtitan.components.lr_scheduler import LRSchedulersContainer
+from torchtitan.components.metrics import MetricsProcessor
+from torchtitan.config import (
+    ActivationCheckpointConfig,
+    CommConfig,
+    TrainingConfig,
+)
+from torchtitan.experiments.ft.config.job_config import FaultTolerance
+from torchtitan.experiments.ft.llama3 import model_registry
+from torchtitan.experiments.ft.optimizer import FTOptimizersContainer
+from torchtitan.experiments.ft.trainer import FaultTolerantTrainer
+from torchtitan.hf_datasets.text_datasets import HuggingFaceTextDataLoader
 from torchtitan.tools.logging import init_logger, logger
-from torchtitan.train import Trainer
+from torchtitan.tools.profiling import ProfilingConfig
 from utils.failure import Failure, FailureActor, FailureController
 
 
@@ -86,8 +98,8 @@ class LighthouseActor(Actor):
 
 
 class TrainingActor(Actor):
-    def __init__(self, job_config: JobConfig, replica_id: int) -> None:
-        self.job_config = job_config
+    def __init__(self, trainer_config: FaultTolerantTrainer.Config, replica_id: int) -> None:
+        self.trainer_config = trainer_config
         rank = current_rank().rank
         self.uid = f"[replica_{replica_id}_trainer_{rank}]"
 
@@ -96,7 +108,7 @@ class TrainingActor(Actor):
         init_logger()
 
         os.environ["TORCHFT_LIGHTHOUSE"] = lighthouse_address
-        trainer = Trainer(self.job_config)
+        trainer = self.trainer_config.build()
         logger.info(f"{self.uid} initialized successfully on {os.getpid()}")
 
         try:
@@ -115,7 +127,7 @@ class TrainingActor(Actor):
 
 @dataclass
 class JobSpec:
-    job_config: JobConfig
+    trainer_config: FaultTolerantTrainer.Config
     remote_lighthouse: bool
     replica_count: int
     hosts_per_replica: int
@@ -140,7 +152,7 @@ class ReplicaActor(Actor):
         self.replica_id = replica_id
 
         self.uid = f"[replica_{replica_id}]"
-        self.spec.job_config.fault_tolerance.replica_id = self.replica_id
+        self.spec.trainer_config.fault_tolerance.replica_id = self.replica_id
         self.scheduler = scheduler
 
         self.failure_actors: FailureActor | None = None
@@ -157,12 +169,12 @@ class ReplicaActor(Actor):
 
         async with trainers_proc_mesh:
             await trainers_proc_mesh.logging_option(stream_to_client=True)
-            await setup_env_for_distributed(trainers_proc_mesh)
+            await setup_torch_elastic_env_async(trainers_proc_mesh)
 
             training_actors = trainers_proc_mesh.spawn(
                 "training_actors",
                 TrainingActor,
-                self.spec.job_config,
+                self.spec.trainer_config,
                 self.replica_id,
             )
 
@@ -342,18 +354,6 @@ def parse_args() -> argparse.Namespace:
         help="Number of training steps (default: 50)",
     )
     parser.add_argument(
-        "--model-config",
-        type=str,
-        default="debug_model.toml",
-        help=f"Relative path to model configuration file (default: {os.path.join(script_dir, 'debug_model.toml')})",
-    )
-    parser.add_argument(
-        "--dataset-path",
-        type=str,
-        default="c4_test",
-        help=f"Relative path to training dataset (default: {os.path.join(script_dir, 'c4_test')})",
-    )
-    parser.add_argument(
         "--tokenizer-path",
         type=str,
         default="debug_tokenizer",
@@ -371,48 +371,39 @@ def parse_args() -> argparse.Namespace:
 def make_job_spec(args: argparse.Namespace) -> JobSpec:
     data_parallel_shard_degree = args.gpu_per_node * args.host_per_replica
 
-    output_path = "./outputs"
-    training_dataset = args.dataset_path.split("/")[-1]
-
     script_dir = os.path.dirname(os.path.abspath(__file__))
-    default_args = [
-        "--job.config_file",
-        os.path.join(script_dir, args.model_config),
-        "--model.tokenizer_path",
-        os.path.join(script_dir, args.tokenizer_path),
-        "--comm.trace_buf_size",
-        "0",
-        "--metrics.log_freq",
-        "1",
-        "--fault_tolerance.enable",
-        "--fault_tolerance.group_size",
-        str(args.replica_count),
-        "--fault_tolerance.process_group",
-        "nccl",
-        "--fault_tolerance.process_group_timeout_ms",
-        "60000",
-        "--parallelism.data_parallel_shard_degree",
-        str(data_parallel_shard_degree),
-        "--activation_checkpoint.mode",
-        "full",
-        "--comm.train_timeout_seconds",
-        "300",
-        "--training.steps",
-        str(args.training_steps),
-        "--training.dataset",
-        training_dataset,
-        "--training.dataset_path",
-        os.path.join(script_dir, args.dataset_path),
-        "--job.dump_folder",
-        output_path,
-        "--metrics.enable_tensorboard",
-    ]
 
-    config_manager = ConfigManager()
-    job_config = config_manager.parse_args(default_args)
+    trainer_config = FaultTolerantTrainer.Config(
+        hf_assets_path=os.path.join(script_dir, args.tokenizer_path),
+        profiling=ProfilingConfig(),
+        metrics=MetricsProcessor.Config(log_freq=1, enable_tensorboard=True),
+        model_spec=model_registry("debugmodel"),
+        optimizer=FTOptimizersContainer.Config(lr=8e-4),
+        lr_scheduler=LRSchedulersContainer.Config(
+            warmup_steps=2,
+            decay_ratio=0.8,
+            decay_type="linear",
+            min_lr_factor=0.0,
+        ),
+        training=TrainingConfig(
+            local_batch_size=8,
+            seq_len=2048,
+            steps=args.training_steps,
+        ),
+        dataloader=HuggingFaceTextDataLoader.Config(),
+        checkpoint=CheckpointManager.Config(),
+        activation_checkpoint=ActivationCheckpointConfig(mode="full"),
+        comm=CommConfig(train_timeout_seconds=300),
+        fault_tolerance=FaultTolerance(
+            enable=True,
+            group_size=data_parallel_shard_degree,
+            process_group="nccl",
+            process_group_timeout_ms=60000,
+        ),
+    )
 
     return JobSpec(
-        job_config=job_config,
+        trainer_config=trainer_config,
         remote_lighthouse=args.remote_lighthouse,
         replica_count=args.replica_count,
         hosts_per_replica=args.host_per_replica,
