@@ -41,7 +41,16 @@ class MonarchSlurm:
 
     def __init__(self):
         self.job_handles: Dict[str, SlurmJob] = {}
+        self._is_owner = True
         atexit.register(self.kill_jobs)
+
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        state["_is_owner"] = False
+        return state
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
 
     async def get_or_create_job(
         self, mesh_name: str, nodes_per_mesh: int = 1, gpus_per_node: int = 8
@@ -55,6 +64,8 @@ class MonarchSlurm:
         self.job_handles[mesh_name] = job
 
     def kill_jobs(self):
+        if not self._is_owner:
+            return
         for mesh_name in self.job_handles.keys():
             self.kill_job(mesh_name)
 
