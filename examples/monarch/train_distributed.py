@@ -14,8 +14,13 @@ from dataclasses import dataclass, field
 from typing import Dict
 
 import torch
+from monarch._rust_bindings.monarch_hyperactor.channel import ChannelTransport
+from monarch._rust_bindings.monarch_hyperactor.config import configure
 from monarch.actor import Actor, current_rank, endpoint, HostMesh, ProcMesh, this_host
 from monarch.job import SlurmJob
+
+# Use TCP transport globally so cross-node actors can communicate
+configure(default_transport=ChannelTransport.TcpWithHostname)
 from monarch.spmd import setup_torch_elastic_env_async
 from torchtitan.components.checkpoint import CheckpointManager
 from torchtitan.components.lr_scheduler import LRSchedulersContainer
