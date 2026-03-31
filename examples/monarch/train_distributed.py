@@ -59,6 +59,7 @@ class MonarchSlurm:
             meshes={mesh_name: nodes_per_mesh},
             gpus_per_node=gpus_per_node,
             job_name=f"{self.job_name_prefix}-{mesh_name}",
+            python_exe="python3",
         )
         job.apply()
         self.job_handles[mesh_name] = job
@@ -74,6 +75,7 @@ class MonarchSlurm:
             meshes=meshes,
             gpus_per_node=gpus_per_node,
             job_name=f"{self.job_name_prefix}-all",
+            python_exe="python3",
         )
         job.apply()
         for name in mesh_names:
