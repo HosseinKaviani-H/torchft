@@ -360,6 +360,12 @@ def parse_args() -> argparse.Namespace:
         help=f"Relative path to tokenizer (default: {os.path.join(script_dir, 'debug_tokenizer')})",
     )
     parser.add_argument(
+        "--dataset-path",
+        type=str,
+        default=None,
+        help="Absolute path to the dataset directory (default: None, downloads from HuggingFace)",
+    )
+    parser.add_argument(
         "--with-failures",
         action="store_true",
         help="Enable the failure injector utility (default: False)",
@@ -390,7 +396,9 @@ def make_job_spec(args: argparse.Namespace) -> JobSpec:
             seq_len=2048,
             steps=args.training_steps,
         ),
-        dataloader=HuggingFaceTextDataLoader.Config(),
+        dataloader=HuggingFaceTextDataLoader.Config(
+            dataset_path=args.dataset_path,
+        ),
         checkpoint=CheckpointManager.Config(),
         activation_checkpoint=ActivationCheckpointConfig(mode="full"),
         comm=CommConfig(train_timeout_seconds=300),
