@@ -372,6 +372,8 @@ class OrchestrationManager:
                 self.scheduler.kill_jobs()
                 await self._create_all_jobs()
         else:
+            # Wait briefly for SLURM to update job state after a process crash.
+            await asyncio.sleep(5)
             # Check if the SLURM job is actually still running (not just in-memory state).
             mesh_name = f"replica_{replica_id}"
             job = self.scheduler.job_handles.get(mesh_name)
