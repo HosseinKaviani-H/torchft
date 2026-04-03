@@ -186,7 +186,7 @@ class ReplicaActor(Actor):
         logger.info(f"{self.uid} Spawning trainers")
 
         trainers_proc_mesh = self.scheduler.proc_mesh(
-            f"replica_{self.replica_id}",
+            f"replica{self.replica_id}",
             num_procs=self.spec.gpus_per_host,
         )
 
@@ -250,7 +250,7 @@ class OrchestrationManager:
         )
 
         for replica_id in range(self.spec.replica_count):
-            await self.scheduler.get_or_create_job(f"replica_{replica_id}")
+            await self.scheduler.get_or_create_job(f"replica{replica_id}")
 
         mesh_futures = {}
         for i in range(self.spec.replica_count):
@@ -314,7 +314,7 @@ class OrchestrationManager:
         In K8s, each replica has its own independent job, so we only need to
         recreate the failed replica's job — not all jobs like in SLURM.
         """
-        mesh_name = f"replica_{replica_id}"
+        mesh_name = f"replica{replica_id}"
 
         if attempt_number % PROC_ATTEMPTS == 0:
             logger.info(
