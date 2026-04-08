@@ -31,7 +31,7 @@ from kubernetes.client import (
     V1Volume,
     V1VolumeMount,
 )
-from monarch.actor import Actor, current_rank, endpoint, HostMesh, ProcMesh, this_host
+from monarch.actor import Actor, current_rank, endpoint, HostMesh, ProcMesh
 from monarch.job.kubernetes import KubernetesJob
 from monarch.spmd import setup_torch_elastic_env_async
 from torchtitan.components.checkpoint import CheckpointManager
@@ -239,8 +239,7 @@ class OrchestrationManager:
     def __init__(self, spec: JobSpec) -> None:
         self.spec = spec
         self.replicas: Dict[int, Replica] = {}
-        self.lighthouse_actor: LighthouseActor | None = None
-        self.lighthouse_mesh: ProcMesh | None = None
+        self.lighthouse = None
 
         self.scheduler = MonarchKubernetes(
             namespace=spec.namespace,
@@ -273,26 +272,21 @@ class OrchestrationManager:
         if failure_future:
             failure_future.cancel()
 
-    async def start_lighthouse(self) -> None:
-        if self.spec.remote_lighthouse:
-            await self.scheduler.get_or_create_job("lighthouse")
-            self.lighthouse_mesh = self.scheduler.proc_mesh("lighthouse", num_procs=1)
-        else:
-            self.lighthouse_mesh = this_host().spawn_procs({"gpus": 1})
+    def start_lighthouse(self) -> None:
+        from torchft.coordination import LighthouseServer
 
-        await self.lighthouse_mesh.logging_option(stream_to_client=True)
-        self.lighthouse_actor = self.lighthouse_mesh.spawn(
-            "lighthouse_actor", LighthouseActor
+        self.lighthouse = LighthouseServer(
+            bind="[::]:0", min_replicas=1, join_timeout_ms=60000
         )
-        self.spec.lighthouse_address = (
-            await self.lighthouse_actor.start_lighthouse.call_one()
+        self.spec.lighthouse_address = self.lighthouse.address()
+        logger.info(
+            f"[Controller] Lighthouse started at {self.spec.lighthouse_address}"
         )
 
-    async def stop_lighthouse(self) -> None:
+    def stop_lighthouse(self) -> None:
         try:
-            if self.lighthouse_mesh:
-                await self.lighthouse_actor.stop_lighthouse.call_one()
-                await self.lighthouse_mesh.stop()
+            if self.lighthouse:
+                self.lighthouse.shutdown()
             logger.info("[Controller] Lighthouse stopped")
         except Exception as e:
             logger.exception(f"[Controller] Failed to stop lighthouse: {e}")
@@ -515,10 +509,10 @@ async def main() -> None:
 
     orchestrator = OrchestrationManager(job_spec)
     try:
-        await orchestrator.start_lighthouse()
+        orchestrator.start_lighthouse()
         await orchestrator.start_training()
     finally:
-        await orchestrator.stop_lighthouse()
+        orchestrator.stop_lighthouse()
 
 
 if __name__ == "__main__":
