@@ -323,7 +323,7 @@ class Manager:
                 lighthouse_addr=lighthouse_addr,
                 hostname=hostname,
                 bind=bind,
-                store_addr=f"{store_addr}:{store_port}",
+                store_addr=f"{socket.getfqdn(store_addr)}:{store_port}",
                 world_size=self._group_world_size,
                 heartbeat_interval=heartbeat_interval,
                 connect_timeout=connect_timeout,
