@@ -49,7 +49,12 @@ from torchtitan.experiments.ft.trainer import FaultTolerantTrainer
 from torchtitan.hf_datasets.text_datasets import HuggingFaceTextDataLoader
 from torchtitan.tools.logging import init_logger, logger
 from torchtitan.tools.profiling import ProfilingConfig
-from utils.failure import Failure, FailureActor, FailureController
+try:
+    from utils.failure import Failure, FailureActor, FailureController
+except ModuleNotFoundError:
+    FailureActor = None
+    FailureController = None
+    Failure = None
 
 
 # ==== Allocation boilerplate ====
@@ -359,7 +364,9 @@ class OrchestrationManager:
         training_actors = trainers_proc_mesh.spawn(
             "training_actors", TrainingActor, spec.trainer_config, replica_id
         )
-        failure_actors = trainers_proc_mesh.spawn("failure_actors", FailureActor)
+        failure_actors = None
+        if FailureActor is not None and self.spec.with_failures:
+            failure_actors = trainers_proc_mesh.spawn("failure_actors", FailureActor)
 
         replica = Replica(replica_id, trainers_proc_mesh, failure_actors, attempt_number)
         self.replicas[replica_id] = replica
