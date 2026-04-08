@@ -220,25 +220,19 @@ class Replica:
 
 
 class ReplicaActor(Actor):
-    def __init__(self, spec: JobSpec, replica_id: int, scheduler: MonarchKubernetes) -> None:
+    def __init__(self, spec: JobSpec, replica_id: int) -> None:
         self.spec = deepcopy(spec)
         self.replica_id = replica_id
 
         self.uid = f"[replica_{replica_id}]"
         self.spec.trainer_config.fault_tolerance.replica_id = self.replica_id
-        self.scheduler = scheduler
 
         self.failure_actors: FailureActor | None = None
 
     @endpoint
-    async def start_replica(self) -> None:
+    async def start_replica(self, trainers_proc_mesh: ProcMesh) -> None:
         init_logger()
-        logger.info(f"{self.uid} Spawning trainers")
-
-        trainers_proc_mesh = self.scheduler.proc_mesh(
-            f"replica{self.replica_id}",
-            num_procs=self.spec.gpus_per_host,
-        )
+        logger.info(f"{self.uid} Starting trainers")
 
         async with trainers_proc_mesh:
             await trainers_proc_mesh.logging_option(stream_to_client=True)
@@ -255,7 +249,7 @@ class ReplicaActor(Actor):
                 "failure_actors", FailureActor
             )
 
-            logger.info(f"{self.uid} Starting trainers")
+            logger.info(f"{self.uid} Starting training")
             await training_actors.start_training.call(self.spec.lighthouse_address)
 
     @endpoint
@@ -393,16 +387,23 @@ class OrchestrationManager:
         )
         await asyncio.sleep(delay)
 
+        # Spawn trainers proc mesh from main process (not inside an actor)
+        # to avoid Timeout(30s) when spawn_procs is called from a subprocess.
+        mesh_name = f"replica{replica_id}"
+        trainers_proc_mesh = self.scheduler.proc_mesh(
+            mesh_name, num_procs=self.spec.gpus_per_host
+        )
+
         replica_proc_mesh = this_host().spawn_procs({"gpus": 1})
         await replica_proc_mesh.logging_option(aggregate_window_sec=None)
 
         replica_actor = replica_proc_mesh.spawn(
-            "replica_actor", ReplicaActor, self.spec, replica_id, self.scheduler
+            "replica_actor", ReplicaActor, self.spec, replica_id
         )
 
         replica = Replica(replica_id, replica_proc_mesh, replica_actor, attempt_number)
         self.replicas[replica_id] = replica
-        await replica.actor.start_replica.call_one()
+        await replica.actor.start_replica.call_one(trainers_proc_mesh)
 
     async def _teardown(self, replica_id: int) -> None:
         try:
