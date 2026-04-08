@@ -426,8 +426,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--tokenizer-path",
         type=str,
-        default="debug_tokenizer",
-        help=f"Relative path to tokenizer (default: {os.path.join(script_dir, 'debug_tokenizer')})",
+        default="/opt/torchtitan/tests/assets/tokenizer",
+        help="Path to tokenizer directory (must exist on worker pods)",
     )
     parser.add_argument(
         "--dataset-path",
@@ -469,7 +469,7 @@ def make_job_spec(args: argparse.Namespace) -> JobSpec:
     script_dir = os.path.dirname(os.path.abspath(__file__))
 
     trainer_config = FaultTolerantTrainer.Config(
-        hf_assets_path=os.path.join(script_dir, args.tokenizer_path),
+        hf_assets_path=args.tokenizer_path,
         profiling=ProfilingConfig(),
         metrics=MetricsProcessor.Config(log_freq=1, enable_tensorboard=True),
         model_spec=model_registry("debugmodel"),
