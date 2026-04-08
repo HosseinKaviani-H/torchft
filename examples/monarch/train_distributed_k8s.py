@@ -16,7 +16,11 @@ from typing import Dict
 import torch
 from monarch.config import configure
 
-configure(enable_log_forwarding=True, message_delivery_timeout="2m")
+configure(
+    enable_log_forwarding=True,
+    message_delivery_timeout="2m",
+    host_spawn_ready_timeout="2m",
+)
 
 from kubernetes.client import (
     V1Container,
