@@ -486,6 +486,7 @@ def make_job_spec(args: argparse.Namespace) -> JobSpec:
             steps=args.training_steps,
         ),
         dataloader=HuggingFaceTextDataLoader.Config(
+            dataset="c4" if args.dataset_path is None else "c4_test",
             dataset_path=args.dataset_path,
         ),
         checkpoint=CheckpointManager.Config(),
