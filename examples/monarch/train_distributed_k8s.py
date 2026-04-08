@@ -179,13 +179,14 @@ class TrainingActor(Actor):
         import functools
         import torchft
 
-        _sock.gethostname = _sock.getfqdn  # fixes http_transport
+        _orig_gethostname = _sock.gethostname
+        _sock.gethostname = lambda: _sock.getfqdn(_orig_gethostname())
 
         _orig_init = torchft.Manager.__init__
         @functools.wraps(_orig_init)
         def _patched_init(self, *args, **kwargs):
             if 'hostname' not in kwargs:
-                kwargs['hostname'] = _sock.getfqdn()
+                kwargs['hostname'] = _sock.getfqdn(_orig_gethostname())
             return _orig_init(self, *args, **kwargs)
         torchft.Manager.__init__ = _patched_init
 
