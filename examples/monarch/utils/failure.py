@@ -119,8 +119,8 @@ class FailureController:
                 try:
                     if last_failure == Failure.KILL_SLURM:
                         FailureController.kill_slurm(scheduler)
-                    else:
-                        last_replica.actor.inject_failure.broadcast(last_failure)
+                    elif last_replica.failure_actors:
+                        await last_replica.failure_actors.fail.choose(last_failure)
                     logger.info(
                         f"[FailureController] Failure injection ({last_failure}) sent to replica {last_replica.rid}"
                     )
