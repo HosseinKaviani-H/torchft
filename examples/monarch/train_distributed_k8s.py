@@ -180,14 +180,17 @@ class TrainingActor(Actor):
         import torchft
 
         _orig_gethostname = _sock.gethostname
-        _sock.gethostname = lambda: _sock.getfqdn(_orig_gethostname())
+        fqdn = _sock.getfqdn(_orig_gethostname())
+        logger.info(f"[FQDN-patch] hostname={_orig_gethostname()}, fqdn={fqdn}")
+        _sock.gethostname = lambda: fqdn
 
         _orig_init = torchft.Manager.__init__
         @functools.wraps(_orig_init)
-        def _patched_init(self, *args, **kwargs):
+        def _patched_init(self_mgr, *args, **kwargs):
             if 'hostname' not in kwargs:
-                kwargs['hostname'] = _sock.getfqdn(_orig_gethostname())
-            return _orig_init(self, *args, **kwargs)
+                kwargs['hostname'] = fqdn
+            logger.info(f"[FQDN-patch] Manager.__init__ called with hostname={kwargs.get('hostname')}")
+            return _orig_init(self_mgr, *args, **kwargs)
         torchft.Manager.__init__ = _patched_init
 
         os.environ["TORCHFT_LIGHTHOUSE"] = lighthouse_address
