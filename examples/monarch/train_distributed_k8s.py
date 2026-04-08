@@ -24,7 +24,7 @@ from kubernetes.client import (
     V1VolumeMount,
 )
 from monarch.actor import Actor, current_rank, endpoint, HostMesh, ProcMesh, this_host
-from monarch.job.kubernetes import KubernetesJob, ImageSpec
+from monarch.job.kubernetes import KubernetesJob
 from monarch.spmd import setup_torch_elastic_env_async
 from torchtitan.components.checkpoint import CheckpointManager
 from torchtitan.components.lr_scheduler import LRSchedulersContainer
@@ -215,55 +215,8 @@ class JobSpec:
 class Replica:
     rid: int
     proc_mesh: ProcMesh
-    actor: "ReplicaActor"
+    failure_actors: "FailureActor | None" = None
     attempt_number: int = 0
-
-
-class ReplicaActor(Actor):
-    def __init__(self, spec: JobSpec, replica_id: int) -> None:
-        self.spec = deepcopy(spec)
-        self.replica_id = replica_id
-
-        self.uid = f"[replica_{replica_id}]"
-        self.spec.trainer_config.fault_tolerance.replica_id = self.replica_id
-
-        self.failure_actors: FailureActor | None = None
-
-    @endpoint
-    async def start_replica(self, trainers_proc_mesh: ProcMesh) -> None:
-        init_logger()
-        logger.info(f"{self.uid} Starting trainers")
-
-        async with trainers_proc_mesh:
-            await trainers_proc_mesh.logging_option(stream_to_client=True)
-            await setup_torch_elastic_env_async(trainers_proc_mesh)
-
-            training_actors = trainers_proc_mesh.spawn(
-                "training_actors",
-                TrainingActor,
-                self.spec.trainer_config,
-                self.replica_id,
-            )
-
-            self.failure_actors = trainers_proc_mesh.spawn(
-                "failure_actors", FailureActor
-            )
-
-            logger.info(f"{self.uid} Starting training")
-            await training_actors.start_training.call(self.spec.lighthouse_address)
-
-    @endpoint
-    async def inject_failure(self, failure_type: Failure):
-        if self.failure_actors:
-            try:
-                logger.info(
-                    f"{self.uid} Injecting failure ({failure_type}) into random trainer"
-                )
-                await self.failure_actors.fail.choose(failure_type)
-            except Exception as e:
-                logger.exception(f"{self.uid} Injected failure: {e}")
-        else:
-            logger.error(f"{self.uid} No failure actors available")
 
 
 # delay before re-creating proc mesh on existing job. change as needed.
@@ -387,23 +340,30 @@ class OrchestrationManager:
         )
         await asyncio.sleep(delay)
 
-        # Spawn trainers proc mesh from main process (not inside an actor)
-        # to avoid Timeout(30s) when spawn_procs is called from a subprocess.
+        # Spawn trainers proc mesh directly from the main process.
+        # This avoids the Timeout(30s) that occurs when spawn_procs is called
+        # from inside a subprocess (ReplicaActor).
         mesh_name = f"replica{replica_id}"
         trainers_proc_mesh = self.scheduler.proc_mesh(
             mesh_name, num_procs=self.spec.gpus_per_host
         )
 
-        replica_proc_mesh = this_host().spawn_procs({"gpus": 1})
-        await replica_proc_mesh.logging_option(aggregate_window_sec=None)
+        spec = deepcopy(self.spec)
+        spec.trainer_config.fault_tolerance.replica_id = replica_id
 
-        replica_actor = replica_proc_mesh.spawn(
-            "replica_actor", ReplicaActor, self.spec, replica_id
+        await trainers_proc_mesh.logging_option(stream_to_client=True)
+        await setup_torch_elastic_env_async(trainers_proc_mesh)
+
+        training_actors = trainers_proc_mesh.spawn(
+            "training_actors", TrainingActor, spec.trainer_config, replica_id
         )
+        failure_actors = trainers_proc_mesh.spawn("failure_actors", FailureActor)
 
-        replica = Replica(replica_id, replica_proc_mesh, replica_actor, attempt_number)
+        replica = Replica(replica_id, trainers_proc_mesh, failure_actors, attempt_number)
         self.replicas[replica_id] = replica
-        await replica.actor.start_replica.call_one(trainers_proc_mesh)
+
+        logger.info(f"[Controller] Replica {replica_id} starting training")
+        await training_actors.start_training.call(spec.lighthouse_address)
 
     async def _teardown(self, replica_id: int) -> None:
         try:
