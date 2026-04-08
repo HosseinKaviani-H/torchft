@@ -172,6 +172,23 @@ class TrainingActor(Actor):
     @endpoint
     async def start_training(self, lighthouse_address: str) -> None:
         init_logger()
+
+        # Patch TorchFT Manager and checkpoint transport to use FQDN
+        # so addresses are resolvable across K8s pods/replicas.
+        import socket as _sock
+        import functools
+        import torchft
+
+        _sock.gethostname = _sock.getfqdn  # fixes http_transport
+
+        _orig_init = torchft.Manager.__init__
+        @functools.wraps(_orig_init)
+        def _patched_init(self, *args, **kwargs):
+            if 'hostname' not in kwargs:
+                kwargs['hostname'] = _sock.getfqdn()
+            return _orig_init(self, *args, **kwargs)
+        torchft.Manager.__init__ = _patched_init
+
         os.environ["TORCHFT_LIGHTHOUSE"] = lighthouse_address
         trainer = self.trainer_config.build()
         logger.info(f"{self.uid} initialized successfully on {os.getpid()}")
