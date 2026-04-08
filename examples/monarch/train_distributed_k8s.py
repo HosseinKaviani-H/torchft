@@ -163,26 +163,6 @@ class MonarchKubernetes:
 # ==== allocation boilerplate ====
 
 
-class LighthouseActor(Actor):
-    def __init__(self) -> None:
-        self.lighthouse = None
-
-    @endpoint
-    def start_lighthouse(self) -> str:
-        from torchft.coordination import LighthouseServer
-
-        self.lighthouse = LighthouseServer(
-            bind="[::]:0", min_replicas=1, join_timeout_ms=60000
-        )
-        return self.lighthouse.address()
-
-    @endpoint
-    def stop_lighthouse(self) -> None:
-        if not self.lighthouse:
-            raise RuntimeError("Lighthouse not started!")
-        self.lighthouse.shutdown()
-
-
 class TrainingActor(Actor):
     def __init__(self, trainer_config: FaultTolerantTrainer.Config, replica_id: int) -> None:
         self.trainer_config = trainer_config
@@ -192,7 +172,6 @@ class TrainingActor(Actor):
     @endpoint
     async def start_training(self, lighthouse_address: str) -> None:
         init_logger()
-
         os.environ["TORCHFT_LIGHTHOUSE"] = lighthouse_address
         trainer = self.trainer_config.build()
         logger.info(f"{self.uid} initialized successfully on {os.getpid()}")
@@ -214,7 +193,6 @@ class TrainingActor(Actor):
 @dataclass
 class JobSpec:
     trainer_config: FaultTolerantTrainer.Config
-    remote_lighthouse: bool
     replica_count: int
     gpus_per_host: int
     with_failures: bool
@@ -285,11 +263,12 @@ class OrchestrationManager:
         self.lighthouse = LighthouseServer(
             bind="[::]:0", min_replicas=1, join_timeout_ms=60000
         )
-        # Replace hostname with IP so worker pods can resolve it
+        # Use FQDN so worker pods can resolve the controller across namespaces.
+        # Requires a headless Service for the controller pod (see launcher.yaml).
         addr = self.lighthouse.address()
-        hostname = _socket.gethostname()
-        pod_ip = _socket.gethostbyname(hostname)
-        self.spec.lighthouse_address = addr.replace(hostname, pod_ip)
+        short_hostname = _socket.gethostname()
+        fqdn = _socket.getfqdn()
+        self.spec.lighthouse_address = addr.replace(short_hostname, fqdn)
         logger.info(
             f"[Controller] Lighthouse started at {self.spec.lighthouse_address}"
         )
@@ -413,11 +392,6 @@ def parse_args() -> argparse.Namespace:
         "--gpus-per-host", type=int, default=8, help="GPUs per pod (default: 8)"
     )
     parser.add_argument(
-        "--remote-lighthouse",
-        action="store_true",
-        help="Run the LighthouseServer on a worker pod (default: False)",
-    )
-    parser.add_argument(
         "--training-steps",
         type=int,
         default=50,
@@ -502,7 +476,6 @@ def make_job_spec(args: argparse.Namespace) -> JobSpec:
 
     return JobSpec(
         trainer_config=trainer_config,
-        remote_lighthouse=args.remote_lighthouse,
         replica_count=args.replica_count,
         gpus_per_host=args.gpus_per_host,
         with_failures=args.with_failures,
