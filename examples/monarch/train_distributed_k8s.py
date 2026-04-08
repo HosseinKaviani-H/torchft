@@ -8,11 +8,21 @@ import argparse
 import asyncio
 import atexit
 import os
+import textwrap
 from copy import deepcopy
 from dataclasses import dataclass
 from typing import Dict
 
 import torch
+from kubernetes.client import (
+    V1Container,
+    V1EmptyDirVolumeSource,
+    V1EnvVar,
+    V1PodSpec,
+    V1ResourceRequirements,
+    V1Volume,
+    V1VolumeMount,
+)
 from monarch.actor import Actor, current_rank, endpoint, HostMesh, ProcMesh, this_host
 from monarch.job.kubernetes import KubernetesJob, ImageSpec
 from monarch.spmd import setup_torch_elastic_env_async
@@ -36,6 +46,44 @@ from utils.failure import Failure, FailureActor, FailureController
 
 # ==== Allocation boilerplate ====
 
+_WORKER_BOOTSTRAP_SCRIPT: str = textwrap.dedent("""\
+    import os
+    import socket
+    from monarch.actor import run_worker_loop_forever
+    port = os.environ.get("MONARCH_PORT", "26600")
+    hostname = socket.getfqdn()
+    address = f"tcp://{hostname}:{port}"
+    run_worker_loop_forever(address=address, ca="trust_all_connections")
+""")
+
+
+def build_gpu_pod_spec(image: str, gpus_per_host: int) -> V1PodSpec:
+    """Build a V1PodSpec with GPU resources and shared memory for NCCL."""
+    gpu_resources = {"nvidia.com/gpu": str(gpus_per_host)}
+    return V1PodSpec(
+        containers=[
+            V1Container(
+                name="worker",
+                image=image,
+                command=["python", "-u", "-c", _WORKER_BOOTSTRAP_SCRIPT],
+                env=[V1EnvVar(name="MONARCH_PORT", value="26600")],
+                resources=V1ResourceRequirements(
+                    limits=gpu_resources,
+                    requests=gpu_resources,
+                ),
+                volume_mounts=[
+                    V1VolumeMount(name="dshm", mount_path="/dev/shm"),
+                ],
+            )
+        ],
+        volumes=[
+            V1Volume(
+                name="dshm",
+                empty_dir=V1EmptyDirVolumeSource(medium="Memory", size_limit="16Gi"),
+            )
+        ],
+    )
+
 
 class MonarchKubernetes:
     """Manages KubernetesJob lifecycle for fault-tolerant training.
@@ -48,11 +96,13 @@ class MonarchKubernetes:
     def __init__(
         self,
         namespace: str,
-        image_spec: ImageSpec | None = None,
+        image: str | None = None,
+        gpus_per_host: int = 8,
         timeout: int | None = None,
     ):
         self.namespace = namespace
-        self.image_spec = image_spec
+        self.image = image
+        self.gpus_per_host = gpus_per_host
         self.timeout = timeout
         self.job_handles: Dict[str, KubernetesJob] = {}
         self._is_owner = True
@@ -68,11 +118,11 @@ class MonarchKubernetes:
 
     async def get_or_create_job(self, mesh_name: str) -> None:
         job = KubernetesJob(namespace=self.namespace, timeout=self.timeout)
-        if self.image_spec is not None:
-            job.add_mesh(mesh_name, num_replicas=1, image_spec=self.image_spec)
+        if self.image is not None:
+            pod_spec = build_gpu_pod_spec(self.image, self.gpus_per_host)
+            job.add_mesh(mesh_name, num_replicas=1, pod_spec=pod_spec)
         else:
             job.add_mesh(mesh_name, num_replicas=1)
-        job.apply()
         self.job_handles[mesh_name] = job
 
     def kill_jobs(self):
@@ -156,7 +206,7 @@ class JobSpec:
     gpus_per_host: int
     with_failures: bool
     namespace: str = ""
-    image_spec: ImageSpec | None = None
+    image: str | None = None
     timeout: int | None = None
     lighthouse_address: str = ""
 
@@ -239,7 +289,8 @@ class OrchestrationManager:
 
         self.scheduler = MonarchKubernetes(
             namespace=spec.namespace,
-            image_spec=spec.image_spec,
+            image=spec.image,
+            gpus_per_host=spec.gpus_per_host,
             timeout=spec.timeout,
         )
         self._job_creation_lock = asyncio.Lock()
@@ -441,11 +492,6 @@ def make_job_spec(args: argparse.Namespace) -> JobSpec:
 
     script_dir = os.path.dirname(os.path.abspath(__file__))
 
-    image_spec = None
-    if args.image:
-        resources = {"nvidia.com/gpu": args.gpus_per_host} if args.gpus_per_host else None
-        image_spec = ImageSpec(image=args.image, resources=resources)
-
     trainer_config = FaultTolerantTrainer.Config(
         hf_assets_path=os.path.join(script_dir, args.tokenizer_path),
         profiling=ProfilingConfig(),
@@ -484,7 +530,7 @@ def make_job_spec(args: argparse.Namespace) -> JobSpec:
         gpus_per_host=args.gpus_per_host,
         with_failures=args.with_failures,
         namespace=args.namespace,
-        image_spec=image_spec,
+        image=args.image,
         timeout=args.timeout,
     )
 
