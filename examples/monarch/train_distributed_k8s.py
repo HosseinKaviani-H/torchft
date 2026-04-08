@@ -278,12 +278,18 @@ class OrchestrationManager:
             failure_future.cancel()
 
     def start_lighthouse(self) -> None:
+        import socket as _socket
+
         from torchft.coordination import LighthouseServer
 
         self.lighthouse = LighthouseServer(
             bind="[::]:0", min_replicas=1, join_timeout_ms=60000
         )
-        self.spec.lighthouse_address = self.lighthouse.address()
+        # Replace hostname with IP so worker pods can resolve it
+        addr = self.lighthouse.address()
+        hostname = _socket.gethostname()
+        pod_ip = _socket.gethostbyname(hostname)
+        self.spec.lighthouse_address = addr.replace(hostname, pod_ip)
         logger.info(
             f"[Controller] Lighthouse started at {self.spec.lighthouse_address}"
         )
