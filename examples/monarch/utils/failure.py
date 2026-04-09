@@ -115,7 +115,10 @@ class FailureController:
                     ]
 
                 last_replica = random.choice(running_replicas)
-                last_failure = random.choice(list(Failure))
+                # Exclude KILL_JOB on K8s: deleting the CRD doesn't kill
+                # already-connected actors, so it's a no-op.
+                process_failures = [f for f in Failure if f != Failure.KILL_JOB]
+                last_failure = random.choice(process_failures)
                 try:
                     if last_failure == Failure.KILL_JOB:
                         FailureController.kill_job(scheduler)
