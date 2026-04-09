@@ -31,7 +31,24 @@ from kubernetes.client import (
     V1Volume,
     V1VolumeMount,
 )
+import monarch.actor
 from monarch.actor import Actor, current_rank, endpoint, HostMesh, ProcMesh
+
+
+def _fault_hook(failure):
+    """Log actor failures instead of crashing the process.
+
+    Monarch's default hook calls sys.exit(1) which delivers KeyboardInterrupt
+    to the main thread, killing the entire program before the orchestration
+    manager can retry the failed replica.
+    """
+    import logging as _logging
+    _logging.getLogger(__name__).warning(
+        f"[Supervision] Actor failure (handled): {failure.report()}"
+    )
+
+
+monarch.actor.unhandled_fault_hook = _fault_hook
 from monarch.job.kubernetes import KubernetesJob
 from monarch.spmd import setup_torch_elastic_env_async
 from torchtitan.components.checkpoint import CheckpointManager
