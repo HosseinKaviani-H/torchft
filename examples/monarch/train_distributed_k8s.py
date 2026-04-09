@@ -31,33 +31,7 @@ from kubernetes.client import (
     V1Volume,
     V1VolumeMount,
 )
-import monarch.actor
-from monarch.actor import Actor, current_rank, endpoint, HostMesh, ProcMesh
-
-# --- Fault hook with event signaling ---
-# The default Monarch fault hook calls sys.exit(1), killing the entire program.
-# Instead, we log the failure and signal the orchestration manager via asyncio
-# events so it can restart the dead replica.
-_event_loop = None
-_replica_failure_events: Dict[int, asyncio.Event] = {}
-
-
-def _fault_hook(failure):
-    """Log actor failures and signal the orchestration manager to restart."""
-    import logging as _logging
-    _logging.getLogger(__name__).warning(
-        f"[Supervision] Actor failure (handled): {failure.report()}"
-    )
-    # Signal all replica failure events — the orchestration manager will
-    # determine which replica actually died.  call_soon_threadsafe is needed
-    # because this hook runs on a Monarch background thread, not the asyncio
-    # event loop thread.
-    if _event_loop is not None:
-        for event in _replica_failure_events.values():
-            _event_loop.call_soon_threadsafe(event.set)
-
-
-monarch.actor.unhandled_fault_hook = _fault_hook
+from monarch.actor import Actor, current_rank, endpoint, HostMesh, ProcMesh, this_host
 from monarch.job.kubernetes import KubernetesJob
 from monarch.spmd import setup_torch_elastic_env_async
 from torchtitan.components.checkpoint import CheckpointManager
@@ -217,6 +191,72 @@ class TrainingActor(Actor):
             logger.info(f"{self.uid} trainer cleaned up")
 
 
+class ReplicaActor(Actor):
+    """Local actor that owns the remote training actors.
+
+    Acts as a supervision boundary: when a remote worker dies, Monarch delivers
+    SupervisionError to this actor's await, which propagates naturally to
+    _run_replica for retry.  No fault-hook overrides needed.
+    """
+
+    def __init__(
+        self,
+        spec: "JobSpec",
+        replica_id: int,
+        scheduler: "MonarchKubernetes",
+    ) -> None:
+        self.spec = deepcopy(spec)
+        self.replica_id = replica_id
+        self.spec.trainer_config.fault_tolerance.replica_id = replica_id
+        self.scheduler = scheduler
+        self.failure_actors = None
+        self.uid = f"[replica_{replica_id}]"
+
+    @endpoint
+    async def start_replica(self) -> None:
+        init_logger()
+        logger.info(f"{self.uid} Spawning trainers")
+
+        mesh_name = f"replica{self.replica_id}"
+        trainers_proc_mesh = self.scheduler.proc_mesh(
+            mesh_name, num_procs=self.spec.gpus_per_host
+        )
+
+        async with trainers_proc_mesh:
+            await trainers_proc_mesh.logging_option(stream_to_client=True)
+            await setup_torch_elastic_env_async(trainers_proc_mesh)
+
+            training_actors = trainers_proc_mesh.spawn(
+                "training_actors",
+                TrainingActor,
+                self.spec.trainer_config,
+                self.replica_id,
+            )
+
+            if FailureActor is not None and self.spec.with_failures:
+                self.failure_actors = trainers_proc_mesh.spawn(
+                    "failure_actors", FailureActor
+                )
+
+            logger.info(f"{self.uid} Starting trainers")
+            await training_actors.start_training.call(
+                self.spec.lighthouse_address
+            )
+
+    @endpoint
+    async def inject_failure(self, failure_type: "Failure"):
+        if self.failure_actors:
+            try:
+                logger.info(
+                    f"{self.uid} Injecting failure ({failure_type}) into random trainer"
+                )
+                await self.failure_actors.fail.choose(failure_type)
+            except Exception as e:
+                logger.exception(f"{self.uid} Injected failure: {e}")
+        else:
+            logger.error(f"{self.uid} No failure actors available")
+
+
 @dataclass
 class JobSpec:
     trainer_config: FaultTolerantTrainer.Config
@@ -233,7 +273,7 @@ class JobSpec:
 class Replica:
     rid: int
     proc_mesh: ProcMesh
-    failure_actors: "FailureActor | None" = None
+    actor: "ReplicaActor"
     attempt_number: int = 0
 
 
@@ -359,59 +399,21 @@ class OrchestrationManager:
         )
         await asyncio.sleep(delay)
 
-        # Spawn trainers proc mesh directly from the main process.
-        # This avoids the Timeout(30s) that occurs when spawn_procs is called
-        # from inside a subprocess (ReplicaActor).
-        mesh_name = f"replica{replica_id}"
-        trainers_proc_mesh = self.scheduler.proc_mesh(
-            mesh_name, num_procs=self.spec.gpus_per_host
+        # Spawn a local ReplicaActor as a supervision boundary.
+        # When the remote worker dies, SupervisionError propagates naturally
+        # to this await — no fault-hook workarounds needed.
+        replica_proc_mesh = this_host().spawn_procs({"gpus": 1})
+        await replica_proc_mesh.logging_option(aggregate_window_sec=None)
+
+        replica_actor = replica_proc_mesh.spawn(
+            "replica_actor", ReplicaActor, self.spec, replica_id, self.scheduler
         )
 
-        spec = deepcopy(self.spec)
-        spec.trainer_config.fault_tolerance.replica_id = replica_id
-
-        await trainers_proc_mesh.logging_option(stream_to_client=True)
-        await setup_torch_elastic_env_async(trainers_proc_mesh)
-
-        training_actors = trainers_proc_mesh.spawn(
-            "training_actors", TrainingActor, spec.trainer_config, replica_id
-        )
-        failure_actors = None
-        if FailureActor is not None and self.spec.with_failures:
-            failure_actors = trainers_proc_mesh.spawn("failure_actors", FailureActor)
-
-        replica = Replica(replica_id, trainers_proc_mesh, failure_actors, attempt_number)
+        replica = Replica(replica_id, replica_proc_mesh, replica_actor, attempt_number)
         self.replicas[replica_id] = replica
 
-        # Race the training call against a failure event.  When _fault_hook
-        # fires (actor died), the event is set and we raise immediately instead
-        # of hanging forever on the training await.
-        failure_event = asyncio.Event()
-        _replica_failure_events[replica_id] = failure_event
-
         logger.info(f"[Controller] Replica {replica_id} starting training")
-
-        async def _await_training():
-            await training_actors.start_training.call(spec.lighthouse_address)
-
-        training_task = asyncio.create_task(_await_training())
-        failure_task = asyncio.create_task(failure_event.wait())
-
-        done, pending = await asyncio.wait(
-            [training_task, failure_task],
-            return_when=asyncio.FIRST_COMPLETED,
-        )
-        for t in pending:
-            t.cancel()
-        _replica_failure_events.pop(replica_id, None)
-
-        if failure_task in done:
-            raise RuntimeError(
-                f"Replica {replica_id} actor died (detected via supervision hook)"
-            )
-        # If training finished first, propagate any exception it raised
-        for t in done:
-            t.result()
+        await replica.actor.start_replica.call_one()
 
     async def _teardown(self, replica_id: int) -> None:
         try:
@@ -543,9 +545,6 @@ def make_job_spec(args: argparse.Namespace) -> JobSpec:
 
 
 async def main() -> None:
-    global _event_loop
-    _event_loop = asyncio.get_running_loop()
-
     init_logger()
 
     args = parse_args()

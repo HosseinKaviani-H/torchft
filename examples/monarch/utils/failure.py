@@ -119,7 +119,9 @@ class FailureController:
                 try:
                     if last_failure == Failure.KILL_JOB:
                         FailureController.kill_job(scheduler)
-                    elif last_replica.failure_actors:
+                    elif hasattr(last_replica, 'actor') and last_replica.actor:
+                        await last_replica.actor.inject_failure.call_one(last_failure)
+                    elif hasattr(last_replica, 'failure_actors') and last_replica.failure_actors:
                         await last_replica.failure_actors.fail.choose(last_failure)
                     logger.info(
                         f"[FailureController] Failure injection ({last_failure}) sent to replica {last_replica.rid}"
