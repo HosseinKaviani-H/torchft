@@ -196,7 +196,10 @@ class ReplicaActor(Actor):
 
     Acts as a supervision boundary: when a remote worker dies, Monarch delivers
     SupervisionError to this actor's await, which propagates naturally to
-    _run_replica for retry.  No fault-hook overrides needed.
+    _run_replica for retry.
+
+    __supervise__ returns True to mark child failures as handled, preventing
+    them from propagating to the root actor (which would call sys.exit(1)).
     """
 
     def __init__(
@@ -211,6 +214,10 @@ class ReplicaActor(Actor):
         self.scheduler = scheduler
         self.failure_actors = None
         self.uid = f"[replica_{replica_id}]"
+
+    def __supervise__(self, failure) -> bool:
+        logger.warning(f"{self.uid} Supervised child failure: {failure}")
+        return True  # handled — do not propagate to root actor
 
     @endpoint
     async def start_replica(self) -> None:
