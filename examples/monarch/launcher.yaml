@@ -77,7 +77,7 @@ spec:
       effect: "NoSchedule"
   containers:
     - name: controller
-      image: ocir.ap-sydney-1.oci.oraclecloud.com/iduyx1qnmway/meta-pytorch/monarch:hossein-ft-v1
+      image: ocir.ap-sydney-1.oci.oraclecloud.com/iduyx1qnmway/meta-pytorch/monarch:hossein-ft-v2
       command: ["sleep"]
       args: ["infinity"]
       volumeMounts:
