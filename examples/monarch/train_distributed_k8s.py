@@ -278,7 +278,8 @@ class Replica:
 
 
 # delay before re-creating proc mesh on existing job. change as needed.
-PROC_ATTEMPT_DELAY = 0
+# Non-zero delay helps Monarch clean up crashed process state before respawning.
+PROC_ATTEMPT_DELAY = 5
 # proc attempts before getting a new scheduler allocation. change as needed.
 PROC_ATTEMPTS = 4
 # attempts before failing training on replica. change as needed.
@@ -358,8 +359,10 @@ class OrchestrationManager:
             logger.info(f"[Controller] replica {replica_id} done")
             await self._teardown(replica_id)
         except BaseException as e:
-            if isinstance(e, KeyboardInterrupt):
-                raise
+            # Monarch delivers KeyboardInterrupt when the root actor sees an
+            # unhandled child failure (e.g. KILL_PROC hard-kills a process).
+            # This is NOT a user-initiated Ctrl+C — treat it as a retriable
+            # failure so the controller stays alive and respins the replica.
             await self._teardown(replica_id)
             logger.exception(f"[Controller] replica {replica_id} failed: {e}")
             await self._run_replica(replica_id, attempt_number + 1)
@@ -417,17 +420,18 @@ class OrchestrationManager:
 
     async def _teardown(self, replica_id: int) -> None:
         try:
-            replica = self.replicas[replica_id]
+            replica = self.replicas.pop(replica_id, None)
+            if replica is None:
+                return
             try:
-                await replica.proc_mesh.stop()
+                await asyncio.wait_for(replica.proc_mesh.stop(), timeout=10)
             except BaseException as e:
-                logger.exception(
-                    f"[Controller] Failed to stop replica {replica_id}, it may already be stopped. {e}"
+                logger.warning(
+                    f"[Controller] Failed to stop replica {replica_id}, it may already be stopped: {e}"
                 )
-            del self.replicas[replica_id]
             del replica.proc_mesh
         except BaseException as e:
-            logger.exception(
+            logger.warning(
                 f"[Controller] Failed to teardown replica {replica_id}: {e}"
             )
 
