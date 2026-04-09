@@ -390,9 +390,11 @@ class OrchestrationManager:
         _replica_failure_events[replica_id] = failure_event
 
         logger.info(f"[Controller] Replica {replica_id} starting training")
-        training_task = asyncio.create_task(
-            training_actors.start_training.call(spec.lighthouse_address)
-        )
+
+        async def _await_training():
+            await training_actors.start_training.call(spec.lighthouse_address)
+
+        training_task = asyncio.create_task(_await_training())
         failure_task = asyncio.create_task(failure_event.wait())
 
         done, pending = await asyncio.wait(
