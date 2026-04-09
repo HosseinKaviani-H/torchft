@@ -155,7 +155,7 @@ class MonarchKubernetes:
 
     def proc_mesh(self, mesh_name: str, num_procs: int) -> ProcMesh:
         job = self.job_handles[mesh_name]
-        mesh: HostMesh = getattr(job.state(), mesh_name)
+        mesh: HostMesh = getattr(job.state(cached_path=None), mesh_name)
         proc_mesh = mesh.spawn_procs({"gpus": num_procs})
         return proc_mesh
 
