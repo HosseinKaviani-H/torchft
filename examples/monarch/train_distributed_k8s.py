@@ -34,18 +34,27 @@ from kubernetes.client import (
 import monarch.actor
 from monarch.actor import Actor, current_rank, endpoint, HostMesh, ProcMesh
 
+# --- Fault hook with event signaling ---
+# The default Monarch fault hook calls sys.exit(1), killing the entire program.
+# Instead, we log the failure and signal the orchestration manager via asyncio
+# events so it can restart the dead replica.
+_event_loop = None
+_replica_failure_events: Dict[int, asyncio.Event] = {}
+
 
 def _fault_hook(failure):
-    """Log actor failures instead of crashing the process.
-
-    Monarch's default hook calls sys.exit(1) which delivers KeyboardInterrupt
-    to the main thread, killing the entire program before the orchestration
-    manager can retry the failed replica.
-    """
+    """Log actor failures and signal the orchestration manager to restart."""
     import logging as _logging
     _logging.getLogger(__name__).warning(
         f"[Supervision] Actor failure (handled): {failure.report()}"
     )
+    # Signal all replica failure events — the orchestration manager will
+    # determine which replica actually died.  call_soon_threadsafe is needed
+    # because this hook runs on a Monarch background thread, not the asyncio
+    # event loop thread.
+    if _event_loop is not None:
+        for event in _replica_failure_events.values():
+            _event_loop.call_soon_threadsafe(event.set)
 
 
 monarch.actor.unhandled_fault_hook = _fault_hook
@@ -374,8 +383,33 @@ class OrchestrationManager:
         replica = Replica(replica_id, trainers_proc_mesh, failure_actors, attempt_number)
         self.replicas[replica_id] = replica
 
+        # Race the training call against a failure event.  When _fault_hook
+        # fires (actor died), the event is set and we raise immediately instead
+        # of hanging forever on the training await.
+        failure_event = asyncio.Event()
+        _replica_failure_events[replica_id] = failure_event
+
         logger.info(f"[Controller] Replica {replica_id} starting training")
-        await training_actors.start_training.call(spec.lighthouse_address)
+        training_task = asyncio.create_task(
+            training_actors.start_training.call(spec.lighthouse_address)
+        )
+        failure_task = asyncio.create_task(failure_event.wait())
+
+        done, pending = await asyncio.wait(
+            [training_task, failure_task],
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        for t in pending:
+            t.cancel()
+        _replica_failure_events.pop(replica_id, None)
+
+        if failure_task in done:
+            raise RuntimeError(
+                f"Replica {replica_id} actor died (detected via supervision hook)"
+            )
+        # If training finished first, propagate any exception it raised
+        for t in done:
+            t.result()
 
     async def _teardown(self, replica_id: int) -> None:
         try:
@@ -507,6 +541,9 @@ def make_job_spec(args: argparse.Namespace) -> JobSpec:
 
 
 async def main() -> None:
+    global _event_loop
+    _event_loop = asyncio.get_running_loop()
+
     init_logger()
 
     args = parse_args()
