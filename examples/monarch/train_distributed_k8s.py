@@ -314,7 +314,7 @@ class OrchestrationManager:
         failure_future = None
         if self.spec.with_failures:
             failure_future = asyncio.create_task(
-                FailureController.execute_failures(self.replicas, self.scheduler, startup_wait=30)
+                FailureController.execute_failures(self.replicas, self.scheduler, startup_wait=30, rest_time=30)
             )
 
         await asyncio.gather(*mesh_futures.values(), return_exceptions=True)
@@ -450,8 +450,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--training-steps",
         type=int,
-        default=50,
-        help="Number of training steps (default: 50)",
+        default=10000,
+        help="Number of training steps (default: 10000)",
     )
     parser.add_argument(
         "--tokenizer-path",
