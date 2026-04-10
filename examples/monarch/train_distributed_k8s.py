@@ -215,16 +215,17 @@ class ReplicaActor(Actor):
         logger.warning(f"{self.uid} Supervised child failure: {failure}")
         return True  # handled — do not propagate to root actor
 
-    @endpoint
-    async def start_replica(self) -> None:
-        init_logger()
-        logger.info(f"{self.uid} Spawning trainers")
-
+    async def _spawn_trainers(self) -> None:
+        """Spawn processes on the (still-alive) HostMesh and run training."""
         mesh_name = f"replica{self.replica_id}"
         host_mesh = self.scheduler.host_mesh(mesh_name)
         trainers_proc_mesh = host_mesh.spawn_procs(
             {"gpus": self.spec.gpus_per_host}
         )
+        # stream_to_client=True forwards training logs (loss, step, etc.) to
+        # the controller.  The log_forwarder actor is parented under this
+        # ReplicaActor (not root), so __supervise__ catches its failure.
+        await trainers_proc_mesh.logging_option(stream_to_client=True)
 
         await setup_torch_elastic_env_async(trainers_proc_mesh)
 
@@ -244,6 +245,29 @@ class ReplicaActor(Actor):
         await training_actors.start_training.call(
             self.spec.lighthouse_address
         )
+
+    @endpoint
+    async def start_replica(self) -> None:
+        init_logger()
+        for attempt in range(PROC_ATTEMPTS):
+            try:
+                logger.info(
+                    f"{self.uid} Spawning trainers (attempt {attempt})"
+                )
+                await self._spawn_trainers()
+                return  # training finished successfully
+            except Exception as e:
+                logger.error(
+                    f"{self.uid} Training failed (attempt {attempt}): {e}"
+                )
+                if attempt < PROC_ATTEMPTS - 1:
+                    logger.info(
+                        f"{self.uid} Retrying in {PROC_ATTEMPT_DELAY}s "
+                        f"on same HostMesh (pod still alive)..."
+                    )
+                    await asyncio.sleep(PROC_ATTEMPT_DELAY)
+                else:
+                    raise  # exhausted inner retries, let outer loop handle
 
     @endpoint
     async def inject_failure(self, failure_type: "Failure"):
