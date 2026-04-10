@@ -153,11 +153,9 @@ class MonarchKubernetes:
         except Exception as e:
             logger.exception(f"Failed to destroy job for {mesh_name}: {e}")
 
-    def proc_mesh(self, mesh_name: str, num_procs: int) -> ProcMesh:
+    def host_mesh(self, mesh_name: str) -> HostMesh:
         job = self.job_handles[mesh_name]
-        mesh: HostMesh = getattr(job.state(cached_path=None), mesh_name)
-        proc_mesh = mesh.spawn_procs({"gpus": num_procs})
-        return proc_mesh
+        return getattr(job.state(cached_path=None), mesh_name)
 
 
 # ==== allocation boilerplate ====
@@ -192,26 +190,25 @@ class TrainingActor(Actor):
 
 
 class ReplicaActor(Actor):
-    """Local actor that owns the remote training actors.
+    """Supervision boundary that owns a replica's training actors.
 
-    Acts as a supervision boundary: when a remote worker dies, Monarch delivers
-    SupervisionError to this actor's await, which propagates naturally to
-    _run_replica for retry.
-
-    __supervise__ returns True to mark child failures as handled, preventing
-    them from propagating to the root actor (which would call sys.exit(1)).
+    Holds a HostMesh and re-spawns processes on it when a trainer dies —
+    no pod restart needed.  __supervise__ suppresses child failures so they
+    don't propagate to the root actor.
     """
 
     def __init__(
         self,
         spec: "JobSpec",
         replica_id: int,
-        scheduler: "MonarchKubernetes",
+        host_mesh: HostMesh,
     ) -> None:
         self.spec = deepcopy(spec)
         self.replica_id = replica_id
         self.spec.trainer_config.fault_tolerance.replica_id = replica_id
-        self.scheduler = scheduler
+        self.host_mesh = host_mesh
+        self.trainers_proc_mesh = None
+        self.training_actors = None
         self.failure_actors = None
         self.uid = f"[replica_{replica_id}]"
 
@@ -219,35 +216,44 @@ class ReplicaActor(Actor):
         logger.warning(f"{self.uid} Supervised child failure: {failure}")
         return True  # handled — do not propagate to root actor
 
+    def _spawn_trainers(self) -> None:
+        """Spawn trainer processes on the existing HostMesh (no pod restart)."""
+        self.trainers_proc_mesh = self.host_mesh.spawn_procs(
+            {"gpus": self.spec.gpus_per_host}
+        )
+        self.training_actors = self.trainers_proc_mesh.spawn(
+            "training_actors",
+            TrainingActor,
+            self.spec.trainer_config,
+            self.replica_id,
+        )
+        if FailureActor is not None and self.spec.with_failures:
+            self.failure_actors = self.trainers_proc_mesh.spawn(
+                "failure_actors", FailureActor
+            )
+
     @endpoint
     async def start_replica(self) -> None:
         init_logger()
-        logger.info(f"{self.uid} Spawning trainers")
 
-        mesh_name = f"replica{self.replica_id}"
-        trainers_proc_mesh = self.scheduler.proc_mesh(
-            mesh_name, num_procs=self.spec.gpus_per_host
-        )
+        for attempt in range(MAX_ATTEMPT):
+            try:
+                logger.info(f"{self.uid} Spawning trainers (attempt {attempt})")
+                self._spawn_trainers()
+                await setup_torch_elastic_env_async(self.trainers_proc_mesh)
 
-        async with trainers_proc_mesh:
-            await setup_torch_elastic_env_async(trainers_proc_mesh)
-
-            training_actors = trainers_proc_mesh.spawn(
-                "training_actors",
-                TrainingActor,
-                self.spec.trainer_config,
-                self.replica_id,
-            )
-
-            if FailureActor is not None and self.spec.with_failures:
-                self.failure_actors = trainers_proc_mesh.spawn(
-                    "failure_actors", FailureActor
+                logger.info(f"{self.uid} Starting trainers")
+                await self.training_actors.start_training.call(
+                    self.spec.lighthouse_address
                 )
-
-            logger.info(f"{self.uid} Starting trainers")
-            await training_actors.start_training.call(
-                self.spec.lighthouse_address
-            )
+                return  # training completed successfully
+            except Exception as e:
+                logger.warning(
+                    f"{self.uid} Training attempt {attempt} failed: {e}"
+                )
+                if attempt + 1 >= MAX_ATTEMPT:
+                    raise
+                await asyncio.sleep(PROC_ATTEMPT_DELAY)
 
     @endpoint
     async def inject_failure(self, failure_type: "Failure"):
@@ -408,14 +414,17 @@ class OrchestrationManager:
         )
         await asyncio.sleep(delay)
 
+        mesh_name = f"replica{replica_id}"
+        host_mesh = self.scheduler.host_mesh(mesh_name)
+
         # Spawn a local ReplicaActor as a supervision boundary.
-        # When the remote worker dies, SupervisionError propagates naturally
-        # to this await — no fault-hook workarounds needed.
+        # It holds the HostMesh and re-spawns processes on failure
+        # without restarting the pod.
         replica_proc_mesh = this_host().spawn_procs({"gpus": 1})
         await replica_proc_mesh.logging_option(aggregate_window_sec=None)
 
         replica_actor = replica_proc_mesh.spawn(
-            "replica_actor", ReplicaActor, self.spec, replica_id, self.scheduler
+            "replica_actor", ReplicaActor, self.spec, replica_id, host_mesh
         )
 
         replica = Replica(replica_id, replica_proc_mesh, replica_actor, attempt_number)

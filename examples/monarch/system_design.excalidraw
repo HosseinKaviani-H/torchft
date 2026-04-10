@@ -336,14 +336,14 @@
       "updated": 1,
       "link": null,
       "locked": false,
-      "text": "• Creates K8s jobs per replica\n• _run_replica (retry loop)\n• _spin_up_replica\n• _teardown on failure\n• Max 16 retry attempts",
+      "text": "• Creates K8s jobs per replica\n• Passes HostMesh to ReplicaActor\n• Outer retry (pod-level only)\n• _ensure_job_alive fallback\n• Inner retry handled by RA",
       "fontSize": 14,
       "fontFamily": 1,
       "textAlign": "left",
       "verticalAlign": "top",
       "baseline": 12,
       "containerId": null,
-      "originalText": "• Creates K8s jobs per replica\n• _run_replica (retry loop)\n• _spin_up_replica\n• _teardown on failure\n• Max 16 retry attempts"
+      "originalText": "• Creates K8s jobs per replica\n• Passes HostMesh to ReplicaActor\n• Outer retry (pod-level only)\n• _ensure_job_alive fallback\n• Inner retry handled by RA"
     },
     {
       "id": "failure_ctrl_box",
@@ -558,14 +558,14 @@
       "updated": 1,
       "link": null,
       "locked": false,
-      "text": "Supervision Boundary (local actors via this_host().spawn_procs())",
+      "text": "Supervision Boundary — ReplicaActor holds HostMesh, retries via spawn_procs()",
       "fontSize": 14,
       "fontFamily": 1,
       "textAlign": "center",
       "verticalAlign": "top",
       "baseline": 12,
       "containerId": null,
-      "originalText": "Supervision Boundary (local actors via this_host().spawn_procs())"
+      "originalText": "Supervision Boundary — ReplicaActor holds HostMesh, retries via spawn_procs()"
     },
     {
       "id": "replica_actor_0",
@@ -652,14 +652,14 @@
       "updated": 1,
       "link": null,
       "locked": false,
-      "text": "• Owns remote trainers\n• start_replica() spawns\n  TrainingActors on GPU pod\n• SupervisionError on\n  child death → retry",
+      "text": "• Holds HostMesh (pod ref)\n• _spawn_trainers() on retry\n• __supervise__ → True\n• Inner retry loop (fast,\n  same pod, no restart)",
       "fontSize": 13,
       "fontFamily": 1,
       "textAlign": "left",
       "verticalAlign": "top",
       "baseline": 11,
       "containerId": null,
-      "originalText": "• Owns remote trainers\n• start_replica() spawns\n  TrainingActors on GPU pod\n• SupervisionError on\n  child death → retry"
+      "originalText": "• Holds HostMesh (pod ref)\n• _spawn_trainers() on retry\n• __supervise__ → True\n• Inner retry loop (fast,\n  same pod, no restart)"
     },
     {
       "id": "replica_actor_1",
@@ -746,14 +746,14 @@
       "updated": 1,
       "link": null,
       "locked": false,
-      "text": "• Owns remote trainers\n• start_replica() spawns\n  TrainingActors on GPU pod\n• SupervisionError on\n  child death → retry",
+      "text": "• Holds HostMesh (pod ref)\n• _spawn_trainers() on retry\n• __supervise__ → True\n• Inner retry loop (fast,\n  same pod, no restart)",
       "fontSize": 13,
       "fontFamily": 1,
       "textAlign": "left",
       "verticalAlign": "top",
       "baseline": 11,
       "containerId": null,
-      "originalText": "• Owns remote trainers\n• start_replica() spawns\n  TrainingActors on GPU pod\n• SupervisionError on\n  child death → retry"
+      "originalText": "• Holds HostMesh (pod ref)\n• _spawn_trainers() on retry\n• __supervise__ → True\n• Inner retry loop (fast,\n  same pod, no restart)"
     },
     {
       "id": "gpu_pod_0",
@@ -1662,14 +1662,14 @@
       "updated": 1,
       "link": null,
       "locked": false,
-      "text": "KILL_PROC on GPU3 → NCCL timeout (300s) kills all 8 GPUs → SupervisionError → ReplicaActor → _run_replica catches → _teardown\n→ _ensure_job_alive (recreate K8s job if needed) → _spin_up_replica → new ReplicaActor → new TrainingActors → rejoin quorum → resume training",
+      "text": "FAST (process dies, pod alive): __supervise__ catches → inner retry → host_mesh.spawn_procs() → new TrainingActors → rejoin quorum (~seconds)\nSLOW (pod dies, fallback): inner retry fails → outer loop → _teardown → _ensure_job_alive → recreate K8s job → new pod → new HostMesh (~minutes)",
       "fontSize": 14,
       "fontFamily": 1,
       "textAlign": "left",
       "verticalAlign": "top",
       "baseline": 12,
       "containerId": null,
-      "originalText": "KILL_PROC on GPU3 → NCCL timeout (300s) kills all 8 GPUs → SupervisionError → ReplicaActor → _run_replica catches → _teardown\n→ _ensure_job_alive (recreate K8s job if needed) → _spin_up_replica → new ReplicaActor → new TrainingActors → rejoin quorum → resume training"
+      "originalText": "FAST (process dies, pod alive): __supervise__ catches → inner retry → host_mesh.spawn_procs() → new TrainingActors → rejoin quorum (~seconds)\nSLOW (pod dies, fallback): inner retry fails → outer loop → _teardown → _ensure_job_alive → recreate K8s job → new pod → new HostMesh (~minutes)"
     }
   ],
   "appState": {
