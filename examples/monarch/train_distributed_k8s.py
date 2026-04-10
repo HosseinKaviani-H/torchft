@@ -230,7 +230,6 @@ class ReplicaActor(Actor):
         )
 
         async with trainers_proc_mesh:
-            await trainers_proc_mesh.logging_option(stream_to_client=True)
             await setup_torch_elastic_env_async(trainers_proc_mesh)
 
             training_actors = trainers_proc_mesh.spawn(
