@@ -222,29 +222,34 @@ class ReplicaActor(Actor):
         trainers_proc_mesh = host_mesh.spawn_procs(
             {"gpus": self.spec.gpus_per_host}
         )
-        # stream_to_client=True forwards training logs (loss, step, etc.) to
-        # the controller.  The log_forwarder actor is parented under this
-        # ReplicaActor (not root), so __supervise__ catches its failure.
-        await trainers_proc_mesh.logging_option(stream_to_client=True)
 
-        await setup_torch_elastic_env_async(trainers_proc_mesh)
+        # async with ensures the proc_mesh is properly cleaned up on failure,
+        # stopping dead processes and releasing actor references so old dead
+        # actors don't keep firing __supervise__ callbacks.
+        async with trainers_proc_mesh:
+            # stream_to_client=True forwards training logs (loss, step, etc.)
+            # to the controller.  The log_forwarder actor is parented under
+            # this ReplicaActor (not root), so __supervise__ catches its failure.
+            await trainers_proc_mesh.logging_option(stream_to_client=True)
 
-        training_actors = trainers_proc_mesh.spawn(
-            "training_actors",
-            TrainingActor,
-            self.spec.trainer_config,
-            self.replica_id,
-        )
+            await setup_torch_elastic_env_async(trainers_proc_mesh)
 
-        if FailureActor is not None and self.spec.with_failures:
-            self.failure_actors = trainers_proc_mesh.spawn(
-                "failure_actors", FailureActor
+            training_actors = trainers_proc_mesh.spawn(
+                "training_actors",
+                TrainingActor,
+                self.spec.trainer_config,
+                self.replica_id,
             )
 
-        logger.info(f"{self.uid} Starting trainers")
-        await training_actors.start_training.call(
-            self.spec.lighthouse_address
-        )
+            if FailureActor is not None and self.spec.with_failures:
+                self.failure_actors = trainers_proc_mesh.spawn(
+                    "failure_actors", FailureActor
+                )
+
+            logger.info(f"{self.uid} Starting trainers")
+            await training_actors.start_training.call(
+                self.spec.lighthouse_address
+            )
 
     @endpoint
     async def start_replica(self) -> None:
