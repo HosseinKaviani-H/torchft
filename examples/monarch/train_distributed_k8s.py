@@ -167,7 +167,7 @@ class TrainingActor(Actor):
         rank = current_rank().rank
         self.uid = f"[replica_{replica_id}_trainer_{rank}]"
 
-    @endpoint
+    @endpoint(instrument=False)
     async def start_training(self, lighthouse_address: str) -> None:
         init_logger()
 
@@ -209,51 +209,70 @@ class ReplicaActor(Actor):
         self.spec.trainer_config.fault_tolerance.replica_id = replica_id
         self.scheduler = scheduler
         self.failure_actors = None
+        self._trainers_proc_mesh = None
+        self._loop = None
         self.uid = f"[replica_{replica_id}]"
 
     def __supervise__(self, failure) -> bool:
         logger.warning(f"{self.uid} Supervised child failure: {failure}")
+        # Stop the proc_mesh so that the blocked call() raises immediately
+        # instead of waiting for the NCCL timeout (300s).  Without this,
+        # the 7 surviving ranks sit in NCCL collectives waiting for the dead
+        # rank, and recovery never starts.
+        #
+        # __supervise__ runs on a Monarch internal thread (no event loop),
+        # so we use call_soon_threadsafe to schedule the stop on the actor's
+        # event loop.
+        if self._trainers_proc_mesh is not None and self._loop is not None:
+            logger.info(f"{self.uid} Stopping trainers proc_mesh due to child failure")
+            pm = self._trainers_proc_mesh
+            self._trainers_proc_mesh = None
+            self._loop.call_soon_threadsafe(self._loop.create_task, pm.stop())
         return True  # handled — do not propagate to root actor
 
     async def _spawn_trainers(self) -> None:
         """Spawn processes on the (still-alive) HostMesh and run training."""
         mesh_name = f"replica{self.replica_id}"
         host_mesh = self.scheduler.host_mesh(mesh_name)
-        trainers_proc_mesh = host_mesh.spawn_procs(
+        self._trainers_proc_mesh = host_mesh.spawn_procs(
             {"gpus": self.spec.gpus_per_host}
         )
 
         # async with ensures the proc_mesh is properly cleaned up on failure,
         # stopping dead processes and releasing actor references so old dead
         # actors don't keep firing __supervise__ callbacks.
-        async with trainers_proc_mesh:
-            # stream_to_client=True forwards training logs (loss, step, etc.)
-            # to the controller.  The log_forwarder actor is parented under
-            # this ReplicaActor (not root), so __supervise__ catches its failure.
-            await trainers_proc_mesh.logging_option(stream_to_client=True)
+        try:
+            async with self._trainers_proc_mesh:
+                # stream_to_client=True forwards training logs (loss, step, etc.)
+                # to the controller.  The log_forwarder actor is parented under
+                # this ReplicaActor (not root), so __supervise__ catches its failure.
+                await self._trainers_proc_mesh.logging_option(stream_to_client=True)
 
-            await setup_torch_elastic_env_async(trainers_proc_mesh)
+                await setup_torch_elastic_env_async(self._trainers_proc_mesh)
 
-            training_actors = trainers_proc_mesh.spawn(
-                "training_actors",
-                TrainingActor,
-                self.spec.trainer_config,
-                self.replica_id,
-            )
-
-            if FailureActor is not None and self.spec.with_failures:
-                self.failure_actors = trainers_proc_mesh.spawn(
-                    "failure_actors", FailureActor
+                training_actors = self._trainers_proc_mesh.spawn(
+                    "training_actors",
+                    TrainingActor,
+                    self.spec.trainer_config,
+                    self.replica_id,
                 )
 
-            logger.info(f"{self.uid} Starting trainers")
-            await training_actors.start_training.call(
-                self.spec.lighthouse_address
-            )
+                if FailureActor is not None and self.spec.with_failures:
+                    self.failure_actors = self._trainers_proc_mesh.spawn(
+                        "failure_actors", FailureActor
+                    )
 
-    @endpoint
+                logger.info(f"{self.uid} Starting trainers")
+                await training_actors.start_training.call(
+                    self.spec.lighthouse_address
+                )
+        finally:
+            self._trainers_proc_mesh = None
+
+    @endpoint(instrument=False)
     async def start_replica(self) -> None:
         init_logger()
+        self._loop = asyncio.get_running_loop()
         for attempt in range(PROC_ATTEMPTS):
             try:
                 logger.info(
@@ -274,7 +293,7 @@ class ReplicaActor(Actor):
                 else:
                     raise  # exhausted inner retries, let outer loop handle
 
-    @endpoint
+    @endpoint(instrument=False)
     async def inject_failure(self, failure_type: "Failure"):
         if self.failure_actors:
             try:
