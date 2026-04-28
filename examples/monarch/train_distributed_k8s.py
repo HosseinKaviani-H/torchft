@@ -227,7 +227,10 @@ class ReplicaActor(Actor):
             logger.info(f"{self.uid} Stopping trainers proc_mesh due to child failure")
             pm = self._trainers_proc_mesh
             self._trainers_proc_mesh = None
-            self._loop.call_soon_threadsafe(self._loop.create_task, pm.stop())
+            try:
+                self._loop.call_soon_threadsafe(lambda: self._loop.create_task(pm.stop()))
+            except Exception as e:
+                logger.warning(f"{self.uid} Failed to schedule proc_mesh stop: {e}")
         return True  # handled — do not propagate to root actor
 
     async def _spawn_trainers(self) -> None:
