@@ -210,28 +210,16 @@ class ReplicaActor(Actor):
         self.scheduler = scheduler
         self.failure_actors = None
         self._trainers_proc_mesh = None
-        self._loop = None
         self.uid = f"[replica_{replica_id}]"
 
-    def __supervise__(self, failure) -> bool:
+    async def __supervise__(self, failure) -> bool:
         logger.warning(f"{self.uid} Supervised child failure: {failure}")
-        # Stop the proc_mesh so that the blocked call() raises immediately
-        # instead of waiting for the NCCL timeout (300s).  Without this,
-        # the 7 surviving ranks sit in NCCL collectives waiting for the dead
-        # rank, and recovery never starts.
-        #
-        # __supervise__ runs on a Monarch internal thread (no event loop),
-        # so we use call_soon_threadsafe to schedule the stop on the actor's
-        # event loop.
-        if self._trainers_proc_mesh is not None and self._loop is not None:
+        if self._trainers_proc_mesh is not None:
             logger.info(f"{self.uid} Stopping trainers proc_mesh due to child failure")
             pm = self._trainers_proc_mesh
             self._trainers_proc_mesh = None
-            try:
-                self._loop.call_soon_threadsafe(lambda: self._loop.create_task(pm.stop()))
-            except Exception as e:
-                logger.warning(f"{self.uid} Failed to schedule proc_mesh stop: {e}")
-        return True  # handled — do not propagate to root actor
+            await pm.stop()
+        return True
 
     async def _spawn_trainers(self) -> None:
         """Spawn processes on the (still-alive) HostMesh and run training."""
@@ -275,7 +263,6 @@ class ReplicaActor(Actor):
     @endpoint(instrument=False)
     async def start_replica(self) -> None:
         init_logger()
-        self._loop = asyncio.get_running_loop()
         for attempt in range(PROC_ATTEMPTS):
             try:
                 logger.info(
