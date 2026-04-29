@@ -1,27 +1,32 @@
 """
-Minimal repro: call() does not raise when a child process is killed.
+Minimal repro: call() does not raise when a child process is killed
+while the surviving process is blocked in an uninterruptible C-level call.
 
-Expected: call() raises SupervisionError after process death.
-Actual: call() hangs forever despite __supervise__ firing and proc_mesh being stopped.
+With time.sleep(1) in a Python loop: call() raises correctly.
+With libc.sleep(300) (simulating NCCL allreduce): call() hangs forever.
+
+This simulates what happens in training: NCCL allreduce is a blocking C++
+call that prevents the process from receiving Monarch's stop signal.
 
 GitHub issue: https://github.com/meta-pytorch/monarch/issues/3435
 """
 import asyncio
+import ctypes
 import os
-import time
 
 from monarch.actor import Actor, endpoint, this_host
 from monarch.config import configure
 
 configure(enable_log_forwarding=True)
 
+libc = ctypes.CDLL("libc.so.6")
+
 
 class WorkerActor(Actor):
     @endpoint(instrument=False)
     async def do_work(self) -> None:
-        print(f"[Worker {os.getpid()}] Starting long-running work")
-        while True:
-            time.sleep(1)
+        print(f"[Worker {os.getpid()}] Starting blocking C-level work (simulates NCCL allreduce)")
+        libc.sleep(300)
 
 
 class KillerActor(Actor):
