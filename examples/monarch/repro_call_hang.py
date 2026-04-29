@@ -11,7 +11,6 @@ call that prevents the process from receiving Monarch's stop signal.
 GitHub issue: https://github.com/meta-pytorch/monarch/issues/3435
 """
 import asyncio
-import ctypes
 import os
 
 from monarch.actor import Actor, endpoint, this_host
@@ -19,12 +18,12 @@ from monarch.config import configure
 
 configure(enable_log_forwarding=True)
 
-libc = ctypes.CDLL("libc.so.6")
-
 
 class WorkerActor(Actor):
     @endpoint(instrument=False)
     async def do_work(self) -> None:
+        import ctypes
+        libc = ctypes.CDLL("libc.so.6")
         print(f"[Worker {os.getpid()}] Starting blocking C-level work (simulates NCCL allreduce)")
         libc.sleep(300)
 
