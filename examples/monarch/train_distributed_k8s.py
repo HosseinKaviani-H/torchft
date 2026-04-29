@@ -214,11 +214,6 @@ class ReplicaActor(Actor):
 
     async def __supervise__(self, failure) -> bool:
         logger.warning(f"{self.uid} Supervised child failure: {failure}")
-        if self._trainers_proc_mesh is not None:
-            logger.info(f"{self.uid} Stopping trainers proc_mesh due to child failure")
-            pm = self._trainers_proc_mesh
-            self._trainers_proc_mesh = None
-            await pm.stop()
         return True
 
     async def _spawn_trainers(self) -> None:
