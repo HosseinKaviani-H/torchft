@@ -1,14 +1,12 @@
 """
-Minimal repro: call() does not raise when one process in a multi-process
-mesh is killed while the surviving processes are blocked in C-level calls.
+Repro: After killing one process in a multi-process mesh, do the surviving
+processes (stuck in C-level blocking calls) get cleaned up?
 
-Setup: 2 processes, each with a WorkerActor (blocks in libc.sleep) and a
-KillerActor. Kill process 0 → process 1 survives but is stuck in C sleep.
-call() should raise SupervisionError but hangs because process 1 is alive
-and blocked.
-
-This simulates NCCL allreduce: 8 GPUs in a collective, 1 dies, 7 are stuck
-waiting in C++ code and can't respond to Monarch's stop signal.
+This verifies:
+1. Are workers in SEPARATE processes? (check PIDs)
+2. Does call() raise when one process dies?
+3. Does the surviving process (stuck in libc.sleep) get killed by proc_mesh cleanup?
+4. Or does it stay alive as a zombie spamming errors?
 
 GitHub issue: https://github.com/meta-pytorch/monarch/issues/3435
 """
@@ -28,17 +26,21 @@ class WorkerActor(Actor):
         libc = ctypes.CDLL("libc.so.6")
         rank = current_rank().rank
         pid = os.getpid()
-        print(f"[Worker rank={rank} pid={pid}] Starting blocking C-level work")
+        print(f"[Worker rank={rank} pid={pid}] Starting blocking C-level work (300s)")
         libc.sleep(300)
+        print(f"[Worker rank={rank} pid={pid}] Finished (should not reach here)")
 
 
 class KillerActor(Actor):
     @endpoint(instrument=False)
-    async def kill_self(self) -> None:
+    async def kill_if_rank_0(self) -> None:
         rank = current_rank().rank
         pid = os.getpid()
-        print(f"[Killer rank={rank} pid={pid}] Killing process")
-        os._exit(1)
+        if rank == 0:
+            print(f"[Killer rank={rank} pid={pid}] I am rank 0 — killing myself")
+            os._exit(1)
+        else:
+            print(f"[Killer rank={rank} pid={pid}] I am rank {rank} — staying alive")
 
 
 class SupervisorActor(Actor):
@@ -47,18 +49,11 @@ class SupervisorActor(Actor):
 
     async def __supervise__(self, failure) -> bool:
         print(f"[Supervisor] __supervise__ fired: {failure}")
-        if self._proc_mesh is not None:
-            print("[Supervisor] Stopping proc_mesh...")
-            pm = self._proc_mesh
-            self._proc_mesh = None
-            await pm.stop()
-            print("[Supervisor] proc_mesh stopped")
         return True
 
     @endpoint(instrument=False)
     async def run(self) -> None:
         host_mesh = this_host()
-        # Spawn 2 processes (2 ranks) — kill rank 0, rank 1 survives but blocks
         self._proc_mesh = host_mesh.spawn_procs({"gpus": 2})
 
         async with self._proc_mesh:
@@ -67,29 +62,32 @@ class SupervisorActor(Actor):
 
             async def delayed_kill():
                 await asyncio.sleep(5)
-                print("[Supervisor] Killing rank 0 only...")
+                print("[Supervisor] Telling all ranks to kill if rank 0...")
                 try:
-                    # choose() picks a random rank — with 2 ranks this kills one
-                    await killers.kill_self.choose()
+                    await killers.kill_if_rank_0.call()
                 except Exception as e:
-                    print(f"[Supervisor] Kill command raised (expected): {e}")
+                    print(f"[Supervisor] Kill call raised: {e}")
 
             asyncio.get_running_loop().create_task(delayed_kill())
 
             print("[Supervisor] Calling workers.do_work.call() on 2 processes")
-            print("[Supervisor] After killing rank 0, rank 1 will be stuck in libc.sleep()")
-            print("[Supervisor] call() should raise but will likely hang...")
+            print("[Supervisor] Watch the PIDs — are they different?")
+            print("[Supervisor] After kill: does call() raise? Does rank 1 get killed?")
             try:
                 await workers.do_work.call()
-                print("[Supervisor] ERROR: call() returned normally — should not happen")
+                print("[Supervisor] ERROR: call() returned normally")
             except Exception as e:
-                print(f"[Supervisor] call() raised (expected): {e}")
+                print(f"[Supervisor] SUCCESS: call() raised: {e}")
+
+        print("[Supervisor] async with block exited — proc_mesh cleaned up")
+        print("[Supervisor] If rank 1 is still spamming, proc_mesh.stop() didn't SIGKILL it")
 
 
 async def main():
-    print("Starting multi-process repro...")
-    print("This spawns 2 processes. Kills 1. The other blocks in C sleep.")
-    print("Expected: call() raises. Actual: call() hangs.\n")
+    print("=== Multi-process repro ===")
+    print("Spawns 2 SEPARATE processes (check PIDs).")
+    print("Kills rank 0. Rank 1 is stuck in libc.sleep(300).")
+    print("Question: does proc_mesh cleanup kill rank 1?\n")
 
     sup_mesh = this_host().spawn_procs({"gpus": 1})
     sup = sup_mesh.spawn("supervisor", SupervisorActor)
@@ -99,7 +97,7 @@ async def main():
     except Exception as e:
         print(f"[Main] run() raised: {e}")
 
-    print("Done")
+    print("=== Done ===")
 
 
 if __name__ == "__main__":
